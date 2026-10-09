@@ -1,0 +1,23 @@
+listen: 127.0.0.1:1080
+log_level: debug
+upstream: socks5://10.0.0.1:7891
+
+process_mode:
+  backend: netch
+  netch_runtime_dir: netch
+  executable_names:
+    - wow.exe
+    - battle.net.exe
+    - agent.exe
+  process_ids: []
+  bypass_private: true
+
+routing:
+  default: proxy
+  rules:
+    - action: direct
+      cidrs:
+        - 127.0.0.0/8
+        - 10.0.0.0/8
+        - 172.16.0.0/12
+        - 192.168.0.0/16

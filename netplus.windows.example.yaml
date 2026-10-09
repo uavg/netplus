@@ -1,0 +1,29 @@
+listen: 127.0.0.1:1080
+log_level: debug
+upstream: socks5://10.0.0.1:7891
+
+# Run netplus as Administrator. Selected applications need no native SOCKS5
+# support because netplus transparently intercepts their IPv4 TCP connections.
+#
+# World of Warcraft can repeatedly connect to 127.0.0.1 helper services.
+# Keep bypass_private enabled so local helper and LAN traffic remains direct.
+process_mode:
+  executable_names:
+    - wow.exe
+    - battle.net.exe
+    - agent.exe
+  process_ids: []
+  bypass_private: true
+
+routing:
+  default: proxy
+  rules:
+    - action: direct
+      cidrs:
+        - 127.0.0.0/8
+        - 10.0.0.0/8
+        - 172.16.0.0/12
+        - 192.168.0.0/16
+    - action: block
+      cidrs:
+        - 203.0.113.0/24
