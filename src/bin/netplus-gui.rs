@@ -62,6 +62,7 @@ struct NetplusApp {
     selected_view: View,
     status: Status,
     child: Option<Child>,
+    shutdown_file: Option<PathBuf>,
     log_sender: Sender<String>,
     log_receiver: Receiver<String>,
     log_lines: VecDeque<String>,
@@ -115,6 +116,7 @@ impl View {
 enum Status {
     Stopped,
     Running,
+    Stopping,
     Error(String),
 }
 
@@ -146,6 +148,8 @@ struct Profile {
     routing: RoutingProfile,
     #[serde(skip_serializing_if = "Option::is_none")]
     process_mode: Option<ProcessProfile>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tun_mode: Option<TunProfile>,
 }
 
 impl Default for Profile {
@@ -156,6 +160,7 @@ impl Default for Profile {
             upstream: Some("socks5://127.0.0.1:1081".into()),
             routing: RoutingProfile::default(),
             process_mode: None,
+            tun_mode: None,
         }
     }
 }
@@ -214,6 +219,30 @@ impl Default for ProcessProfile {
             executable_names: Vec::new(),
             process_ids: Vec::new(),
             bypass_private: true,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct TunProfile {
+    #[serde(default = "default_tun_interface_name")]
+    interface_name: String,
+    #[serde(default)]
+    ipv6: bool,
+    #[serde(default = "default_tun_mtu")]
+    mtu: u16,
+    #[serde(default = "default_tun_max_sessions")]
+    max_sessions: usize,
+}
+
+impl Default for TunProfile {
+    fn default() -> Self {
+        Self {
+            interface_name: default_tun_interface_name(),
+            ipv6: false,
+            mtu: default_tun_mtu(),
+            max_sessions: default_tun_max_sessions(),
         }
     }
 }
@@ -324,6 +353,7 @@ impl NetplusApp {
             selected_view: View::Connections,
             status,
             child: None,
+            shutdown_file: None,
             log_sender,
             log_receiver,
             log_lines: VecDeque::new(),
@@ -416,10 +446,18 @@ impl NetplusApp {
                 return;
             }
         };
+        let shutdown_file =
+            std::env::temp_dir().join(format!("netplus-gui-{}.stop", std::process::id()));
+        if let Err(error) = remove_file_if_present(&shutdown_file) {
+            self.set_error(format!("Failed to prepare shutdown signal: {error}"));
+            return;
+        }
         let mut command = Command::new(executable);
         command
             .arg("--config")
             .arg(&self.config_path)
+            .arg("--shutdown-file")
+            .arg(&shutdown_file)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -434,6 +472,7 @@ impl NetplusApp {
                     spawn_log_reader(stderr, self.log_sender.clone());
                 }
                 self.child = Some(child);
+                self.shutdown_file = Some(shutdown_file);
                 self.status = Status::Running;
                 self.push_log("Started netplus service".into());
             }
@@ -482,16 +521,19 @@ impl NetplusApp {
     }
 
     fn stop(&mut self) {
-        let Some(mut child) = self.child.take() else {
+        if self.child.is_none() {
+            return;
+        }
+        let Some(shutdown_file) = self.shutdown_file.as_ref() else {
+            self.set_error("Failed to stop netplus: shutdown signal is unavailable".into());
             return;
         };
-        match child.kill().and_then(|()| child.wait()) {
-            Ok(_) => {
-                self.status = Status::Stopped;
-                self.push_log("Stopped netplus service".into());
-            }
-            Err(error) => self.set_error(format!("Failed to stop netplus: {error}")),
+        if let Err(error) = std::fs::write(shutdown_file, b"stop") {
+            self.set_error(format!("Failed to stop netplus: {error}"));
+            return;
         }
+        self.status = Status::Stopping;
+        self.push_log("Stopping netplus service and restoring routes".into());
     }
 
     fn refresh_process(&mut self) {
@@ -515,11 +557,16 @@ impl NetplusApp {
         let Some(child) = self.child.as_mut() else {
             return;
         };
+        let was_stopping = matches!(self.status, Status::Stopping);
         match child.try_wait() {
             Ok(Some(status)) => {
                 self.child = None;
+                self.clear_shutdown_file();
                 if status.success() {
                     self.status = Status::Stopped;
+                    if was_stopping {
+                        self.push_log("Stopped netplus service".into());
+                    }
                 } else {
                     self.set_error(format!("netplus exited with {status}"));
                 }
@@ -527,6 +574,7 @@ impl NetplusApp {
             Ok(None) => {}
             Err(error) => {
                 self.child = None;
+                self.clear_shutdown_file();
                 self.set_error(format!("Failed to read process status: {error}"));
             }
         }
@@ -563,6 +611,12 @@ impl NetplusApp {
         self.log_lines.push_back(line);
     }
 
+    fn clear_shutdown_file(&mut self) {
+        if let Some(path) = self.shutdown_file.take() {
+            let _ = remove_file_if_present(&path);
+        }
+    }
+
     fn set_error(&mut self, message: String) {
         self.push_log(message.clone());
         self.status = Status::Error(message);
@@ -572,6 +626,7 @@ impl NetplusApp {
         match &self.status {
             Status::Stopped => ("Stopped", Color32::GRAY),
             Status::Running => ("Running", SUCCESS),
+            Status::Stopping => ("Stopping", WARNING_TEXT),
             Status::Error(_) => ("Error", ERROR_TEXT),
         }
     }
@@ -621,7 +676,7 @@ impl NetplusApp {
                         ui.add_space(12.0);
                         if ui
                             .add_enabled(
-                                self.child.is_some(),
+                                matches!(self.status, Status::Running),
                                 egui::Button::new("■  Stop")
                                     .fill(ERROR_TEXT)
                                     .corner_radius(6),
@@ -879,10 +934,73 @@ impl NetplusApp {
     fn show_applications(&mut self, ui: &mut egui::Ui) {
         page_header(
             ui,
-            "Applications",
-            "Only matching Windows processes are intercepted. netplus itself is always excluded.",
+            "Traffic Capture",
+            "Choose selected-application interception or full-system Wintun routing.",
         );
         egui::ScrollArea::vertical().show(ui, |ui| {
+            card(ui, |ui| {
+                ui.heading("Capture mode");
+                let mut full_system = self.config.tun_mode.is_some();
+                let was_full_system = full_system;
+                ui.radio_value(&mut full_system, false, "Selected applications");
+                ui.radio_value(&mut full_system, true, "Full system (Wintun)");
+                if full_system != was_full_system {
+                    if full_system {
+                        self.config.tun_mode = Some(TunProfile::default());
+                        self.config.process_mode = None;
+                        self.process_ids_text.clear();
+                    } else {
+                        self.config.tun_mode = None;
+                        self.config.process_mode = Some(ProcessProfile::default());
+                    }
+                }
+                if full_system {
+                    ui.label(
+                        RichText::new(
+                            "Routes system TCP and UDP traffic through the SOCKS5 upstream.",
+                        )
+                        .small()
+                        .color(MUTED_TEXT),
+                    );
+                }
+            });
+            ui.add_space(12.0);
+
+            if let Some(profile) = self.config.tun_mode.as_mut() {
+                card(ui, |ui| {
+                    ui.heading("Wintun settings");
+                    form_row(ui, "Interface name", |ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut profile.interface_name)
+                                .desired_width(220.0),
+                        );
+                    });
+                    form_row(ui, "MTU", |ui| {
+                        ui.add(egui::DragValue::new(&mut profile.mtu).range(576..=9000));
+                    });
+                    form_row(ui, "Maximum sessions", |ui| {
+                        ui.add(
+                            egui::DragValue::new(&mut profile.max_sessions)
+                                .range(1..=1_000_000),
+                        );
+                    });
+                    form_row(ui, "IPv6", |ui| {
+                        ui.add_enabled(
+                            false,
+                            egui::Checkbox::new(&mut profile.ipv6, "Not supported yet"),
+                        );
+                    });
+                    ui.label(
+                        RichText::new(
+                            "wintun.dll must be beside netplus.exe. Stop netplus gracefully so routes and DNS are restored.",
+                        )
+                        .small()
+                        .color(WARNING_TEXT),
+                    );
+                });
+                return;
+            }
+
             let profile = self
                 .config
                 .process_mode
@@ -1159,10 +1277,31 @@ impl eframe::App for NetplusApp {
 
 impl Drop for NetplusApp {
     fn drop(&mut self) {
-        if let Some(child) = self.child.as_mut() {
-            let _ = child.kill();
-            let _ = child.wait();
+        if let Some(path) = self.shutdown_file.as_ref() {
+            let _ = std::fs::write(path, b"stop");
         }
+        if let Some(child) = self.child.as_mut() {
+            let _ = wait_for_child_shutdown(child);
+        }
+        self.clear_shutdown_file();
+    }
+}
+
+fn wait_for_child_shutdown(child: &mut Child) -> std::io::Result<()> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        if child.try_wait()?.is_some() {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill()?;
+            child.wait()?;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "netplus did not stop within 60 seconds",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -1398,12 +1537,32 @@ fn default_netch_runtime_dir() -> PathBuf {
     PathBuf::from("netch")
 }
 
+fn default_tun_interface_name() -> String {
+    "netplus".into()
+}
+
+fn default_tun_mtu() -> u16 {
+    1500
+}
+
+fn default_tun_max_sessions() -> usize {
+    1024
+}
+
 fn default_config_path() -> PathBuf {
     std::env::current_exe()
         .ok()
         .and_then(|path| path.parent().map(Path::to_owned))
         .unwrap_or_else(|| PathBuf::from("."))
         .join("config")
+}
+
+fn remove_file_if_present(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 fn service_executable() -> Result<PathBuf, String> {

@@ -1,0 +1,57 @@
+listen: 127.0.0.1:1080
+log_level: debug
+# Replace this placeholder with your SOCKS5 server. Do not use 10.0.0.1,
+# which is reserved as tun2proxy's internal Wintun gateway.
+upstream: socks5://proxy.example:1080
+
+# Run netplus as Administrator. TUN mode routes system TCP and UDP traffic
+# through the SOCKS5 upstream. It cannot be enabled with process_mode.
+#
+# TUN mode requires wintun.dll beside netplus.exe. It does not require the
+# Netch runtime (Redirector.bin, nfapi.dll, or nfdriver.sys) or WinDivert files.
+tun_mode:
+  interface_name: netplus
+  ipv6: false
+  mtu: 1500
+  max_sessions: 1024
+
+# TUN-captured traffic currently uses an all-proxy policy. Existing specific
+# Windows routes, such as localhost and your directly connected LAN subnet,
+# remain direct. The rules below apply only to programs that explicitly use
+# the local SOCKS5 listener at 127.0.0.1:1080, not to Wintun traffic.
+routing:
+  default: proxy
+  rules:
+    # Mainland China WoW/Battle.net endpoints. Domain matching is preferred
+    # because most launcher, patch, and website addresses use dynamic CDNs.
+    # These rules affect only the local SOCKS5 listener, not TUN traffic.
+    - action: direct
+      domains:
+        - blizzard.cn
+        - wowchina.com
+        - battlenet.com.cn
+        - blizzardgames.cn
+        - bnet.163.com
+        - wow.res.netease.com
+        - cn.patch.battle.net
+        - cn.version.battle.net
+      # Narrow DNS snapshots verified on 2026-10-12. Review periodically;
+      # actual game-realm addresses are assigned dynamically.
+      cidrs:
+        - 106.2.69.220/32
+        - 42.186.114.251/32
+        - 42.186.114.252/32
+        - 42.186.114.253/32
+        - 59.111.45.115/32
+    - action: direct
+      domains:
+        - localhost
+        - "*.lan"
+      cidrs:
+        - 127.0.0.0/8
+        - 10.0.0.0/8
+        - 172.16.0.0/12
+        - 192.168.0.0/16
+    - action: block
+      domains:
+        - ads.example

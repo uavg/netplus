@@ -4,9 +4,8 @@
 provides a local SOCKS5 endpoint and routes each TCP connection directly, through
 an upstream SOCKS5 proxy, or blocks it according to ordered domain and CIDR rules.
 
-This is the user-space foundation of a Netch-like tool. Process interception,
-TUN routing, UDP relay, and additional proxy protocols require separate
-platform-specific transports and are not part of this first version.
+On Windows, netplus can transparently intercept selected processes with
+WinDivert or route full-system TCP and UDP traffic through a Wintun adapter.
 
 ## Run
 
@@ -52,6 +51,41 @@ Start from `netplus.windows.example.yaml`. Because interception happens after
 Windows resolves DNS, process-mode routing uses CIDR rules; domain rules still
 apply to clients using the local SOCKS5 endpoint.
 
+### Windows full-system TUN mode
+
+Run as Administrator and use `netplus.tun.example.yaml`, or select **Full system
+(Wintun)** on the GUI's Traffic Capture page:
+
+```yaml
+tun_mode:
+  interface_name: netplus
+  ipv6: false
+  mtu: 1500
+  max_sessions: 1024
+```
+
+TUN mode uses the embedded `tun2proxy` engine with Wintun routes to forward TCP
+and UDP through the configured SOCKS5 upstream. Netplus resolves and bypasses
+the upstream before starting Wintun to avoid proxy loops.
+Shutdown removes only the routes netplus added, preserving the machine's
+original default routes, metrics, VPN routes, and DNS configuration. Existing
+more-specific routes, including normal LAN routes, remain preferred.
+
+The upstream must not resolve to `10.0.0.1`, which is tun2proxy's fixed internal
+Wintun gateway. Use another address for the SOCKS5 server when TUN mode is
+enabled.
+
+Place the signed official `wintun.dll` beside `netplus.exe`. The packaging
+script copies the DLL produced by Cargo and the Wintun license automatically.
+`tun_mode` and `process_mode` are mutually exclusive. TUN traffic does not use
+netplus's ordered routing rules; those continue to apply to the local SOCKS5
+listener. IPv6 TUN routing is not supported yet.
+
+Always stop TUN mode with **Stop** in the GUI or Ctrl-C in the terminal. Force
+termination or a crash can interrupt route restoration; if connectivity does
+not recover, disable the `netplus` adapter and restore the original default
+route and DNS settings, or restart Windows.
+
 For Windows builds, download the official WinDivert SDK and point Cargo at its
 `x64` directory:
 
@@ -77,10 +111,10 @@ driver open, restart Windows and run the script again.
 ### Desktop GUI
 
 The Windows package includes `netplus-gui.exe`, a native desktop interface for
-managing the proxy server, intercepted applications, ordered routing rules,
-connection activity, and live logs. Advanced users can still edit the raw YAML
-profile. Run the GUI as Administrator so its `netplus.exe` child can load
-WinDivert.
+managing the proxy server, process or full-system capture, ordered routing
+rules, connection activity, and live logs. Advanced users can still edit the
+raw YAML profile. Run the GUI as Administrator so its `netplus.exe` child can
+load WinDivert or Wintun.
 
 The GUI always loads and saves `config` beside the executables. There is no
 profile picker; use the structured settings pages or the Advanced YAML page.
@@ -142,6 +176,7 @@ desktop GUI exposes the same check under **Proxy Server → Test connection**.
 - Concurrent Tokio connection relay
 - Graceful Ctrl-C shutdown
 - Windows IPv4 TCP interception by executable name or PID
+- Windows full-system TCP/UDP forwarding through Wintun
 
 Process interception currently supports IPv4 TCP. IPv6 and UDP traffic are left
 untouched.

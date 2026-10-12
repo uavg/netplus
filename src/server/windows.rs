@@ -28,6 +28,7 @@ use crate::{
 };
 
 mod netch;
+mod tun;
 
 type FlowTable = Arc<RwLock<HashMap<u16, Ipv4Flow>>>;
 
@@ -40,19 +41,34 @@ struct Ipv4Flow {
     process_name: String,
 }
 
-pub(super) enum ProcessMode {
+pub(super) enum TrafficMode {
+    None,
     WinDivert {
         listener_task: tokio::task::JoinHandle<()>,
     },
     Netch {
         _mode: netch::NetchProcessMode,
     },
+    Tun(tun::TunMode),
 }
 
-impl ProcessMode {
-    pub async fn start(config: &Config, state: Arc<State>) -> anyhow::Result<Option<Self>> {
+impl TrafficMode {
+    pub async fn start_with_cancellation(
+        config: &Config,
+        state: Arc<State>,
+        startup_cancel: tun2proxy::CancellationToken,
+    ) -> anyhow::Result<Self> {
+        if let Some(tun_config) = config.tun_mode.clone() {
+            ensure!(
+                unsafe { IsUserAnAdmin() } != 0,
+                "Windows TUN mode requires Administrator privileges"
+            );
+            return tun::TunMode::start(config, tun_config, startup_cancel)
+                .await
+                .map(Self::Tun);
+        }
         let Some(process_config) = config.process_mode.clone() else {
-            return Ok(None);
+            return Ok(Self::None);
         };
         ensure!(
             unsafe { IsUserAnAdmin() } != 0,
@@ -60,7 +76,7 @@ impl ProcessMode {
         );
         if process_config.backend == ProcessBackend::Netch {
             return netch::NetchProcessMode::start(config, process_config)
-                .map(|mode| Some(Self::Netch { _mode: mode }));
+                .map(|mode| Self::Netch { _mode: mode });
         }
 
         let listener = TcpListener::bind("0.0.0.0:0")
@@ -82,14 +98,24 @@ impl ProcessMode {
         start_packet_worker(network_handle, listener_port, Arc::clone(&flows))?;
         let listener_task = start_listener(listener, state, flows);
         info!(listener_port, "Windows process interception started");
-        Ok(Some(Self::WinDivert { listener_task }))
+        Ok(Self::WinDivert { listener_task })
     }
-}
 
-impl Drop for ProcessMode {
-    fn drop(&mut self) {
-        if let Self::WinDivert { listener_task } = self {
-            listener_task.abort();
+    pub async fn shutdown(&mut self) -> anyhow::Result<()> {
+        match self {
+            Self::WinDivert { listener_task } => listener_task.abort(),
+            Self::Tun(mode) => return mode.shutdown().await,
+            Self::None | Self::Netch { .. } => {}
+        }
+        Ok(())
+    }
+
+    pub async fn wait_for_failure(&mut self) -> anyhow::Error {
+        match self {
+            Self::Tun(mode) => mode.wait_for_failure().await,
+            Self::None | Self::WinDivert { .. } | Self::Netch { .. } => {
+                std::future::pending().await
+            }
         }
     }
 }

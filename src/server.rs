@@ -1,4 +1,5 @@
 use std::{
+    future::Future,
     io,
     net::{IpAddr, SocketAddr},
     sync::Arc,
@@ -24,49 +25,106 @@ use crate::{
 mod windows;
 
 pub async fn run(config: Config) -> anyhow::Result<()> {
+    run_with_shutdown(config, async {
+        tokio::signal::ctrl_c()
+            .await
+            .context("failed to listen for shutdown signal")
+    })
+    .await
+}
+
+pub async fn run_with_shutdown<F>(config: Config, shutdown: F) -> anyhow::Result<()>
+where
+    F: Future<Output = anyhow::Result<()>>,
+{
+    tokio::pin!(shutdown);
     let listener = TcpListener::bind(config.listen)
         .await
         .with_context(|| format!("failed to listen on {}", config.listen))?;
+    let listener_address = listener.local_addr()?;
     let state = Arc::new(State {
         router: config.router()?,
         upstream: config.upstream()?,
     });
     #[cfg(windows)]
-    let _process_mode = windows::ProcessMode::start(&config, Arc::clone(&state)).await?;
-    #[cfg(not(windows))]
-    if config.process_mode.is_some() {
-        anyhow::bail!("process_mode is only supported on Windows");
-    }
-    info!(address = %listener.local_addr()?, "SOCKS5 listener started");
-
-    let mut clients = JoinSet::new();
-    loop {
+    let mut traffic_mode = {
+        let startup_cancel = tun2proxy::CancellationToken::new();
+        let startup = windows::TrafficMode::start_with_cancellation(
+            &config,
+            Arc::clone(&state),
+            startup_cancel.clone(),
+        );
+        tokio::pin!(startup);
         tokio::select! {
-            accepted = listener.accept() => {
-                let (stream, peer) = accepted.context("failed to accept connection")?;
-                let state = Arc::clone(&state);
-                clients.spawn(async move {
-                    if let Err(error) = handle_client(stream, &state).await {
-                        warn!(%peer, %error, "client connection failed");
+            result = &mut startup => result?,
+            signal = &mut shutdown => {
+                startup_cancel.cancel();
+                match startup.await {
+                    Ok(mut traffic_mode) => traffic_mode.shutdown().await?,
+                    Err(error) => {
+                        warn!(%error, "traffic mode startup cancelled");
                     }
-                });
-            }
-            Some(result) = clients.join_next(), if !clients.is_empty() => {
-                if let Err(error) = result {
-                    warn!(%error, "client task terminated unexpectedly");
                 }
-            }
-            signal = tokio::signal::ctrl_c() => {
-                signal.context("failed to listen for shutdown signal")?;
-                info!("shutdown signal received");
-                break;
+                return signal;
             }
         }
+    };
+    #[cfg(not(windows))]
+    if config.process_mode.is_some() || config.tun_mode.is_some() {
+        anyhow::bail!("process_mode and tun_mode are only supported on Windows");
     }
+    info!(address = %listener_address, "SOCKS5 listener started");
+
+    let mut clients = JoinSet::new();
+    let result = {
+        #[cfg(windows)]
+        let traffic_failure = traffic_mode.wait_for_failure();
+        #[cfg(not(windows))]
+        let traffic_failure = std::future::pending::<anyhow::Error>();
+        tokio::pin!(traffic_failure);
+        loop {
+            tokio::select! {
+                accepted = listener.accept() => {
+                    let (stream, peer) = match accepted.context("failed to accept connection") {
+                        Ok(connection) => connection,
+                        Err(error) => break Err(error),
+                    };
+                    let state = Arc::clone(&state);
+                    clients.spawn(async move {
+                        if let Err(error) = handle_client(stream, &state).await {
+                            warn!(%peer, %error, "client connection failed");
+                        }
+                    });
+                }
+                Some(result) = clients.join_next(), if !clients.is_empty() => {
+                    if let Err(error) = result {
+                        warn!(%error, "client task terminated unexpectedly");
+                    }
+                }
+                signal = &mut shutdown => {
+                    match signal {
+                        Ok(()) => {
+                            info!("shutdown signal received");
+                            break Ok(());
+                        }
+                        Err(error) => break Err(error),
+                    }
+                }
+                error = &mut traffic_failure => {
+                    break Err(error);
+                }
+            }
+        }
+    };
 
     drop(listener);
     clients.shutdown().await;
-    Ok(())
+    #[cfg(windows)]
+    let shutdown_result = traffic_mode.shutdown().await;
+    #[cfg(not(windows))]
+    let shutdown_result: anyhow::Result<()> = Ok(());
+    shutdown_result?;
+    result
 }
 
 pub async fn test_upstream(config: &Config) -> anyhow::Result<IpAddr> {

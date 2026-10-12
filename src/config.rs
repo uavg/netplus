@@ -32,6 +32,7 @@ pub struct Config {
     #[serde(default)]
     pub routing: RoutingConfig,
     pub process_mode: Option<ProcessModeConfig>,
+    pub tun_mode: Option<TunModeConfig>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize)]
@@ -78,6 +79,19 @@ pub enum ProcessBackend {
     #[default]
     Windivert,
     Netch,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TunModeConfig {
+    #[serde(default = "default_tun_name")]
+    pub interface_name: String,
+    #[serde(default)]
+    pub ipv6: bool,
+    #[serde(default = "default_tun_mtu")]
+    pub mtu: u16,
+    #[serde(default = "default_tun_sessions")]
+    pub max_sessions: usize,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -138,6 +152,10 @@ impl Config {
             "an upstream is required by proxy routing rules"
         );
         self.router()?;
+        ensure!(
+            self.process_mode.is_none() || self.tun_mode.is_none(),
+            "process_mode and tun_mode cannot be enabled together"
+        );
         if let Some(process_mode) = &self.process_mode {
             ensure!(
                 !process_mode.executable_names.is_empty() || !process_mode.process_ids.is_empty(),
@@ -156,6 +174,33 @@ impl Config {
                     "the experimental Netch backend does not support process_ids; use executable_names"
                 );
             }
+        }
+        if let Some(tun_mode) = &self.tun_mode {
+            ensure!(upstream.is_some(), "tun_mode requires a SOCKS5 upstream");
+            ensure!(
+                !tun_mode.ipv6,
+                "tun_mode.ipv6 is not supported on Windows yet"
+            );
+            ensure!(
+                !tun_mode.interface_name.trim().is_empty(),
+                "tun_mode interface_name must not be empty"
+            );
+            ensure!(
+                tun_mode
+                    .interface_name
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric()
+                        || matches!(character, '-' | '_' | '.')),
+                "tun_mode interface_name may only contain ASCII letters, numbers, '-', '_', or '.'"
+            );
+            ensure!(
+                (576..=9000).contains(&tun_mode.mtu),
+                "tun_mode MTU must be between 576 and 9000"
+            );
+            ensure!(
+                tun_mode.max_sessions > 0,
+                "tun_mode max_sessions must be greater than zero"
+            );
         }
         Ok(())
     }
@@ -238,6 +283,18 @@ fn default_netch_runtime_dir() -> PathBuf {
     PathBuf::from("netch")
 }
 
+fn default_tun_name() -> String {
+    "netplus".into()
+}
+
+fn default_tun_mtu() -> u16 {
+    1500
+}
+
+fn default_tun_sessions() -> usize {
+    1024
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,6 +327,37 @@ mod tests {
         let config: Config = serde_yaml::from_str(
             "upstream: socks5://127.0.0.1:1080\n\
              process_mode:\n  backend: netch\n  process_ids: [42]\n",
+        )
+        .unwrap();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_process_and_tun_modes_together() {
+        let config: Config = serde_yaml::from_str(
+            "upstream: socks5://127.0.0.1:1080\n\
+             process_mode:\n  executable_names: [game.exe]\n\
+             tun_mode:\n  interface_name: netplus\n",
+        )
+        .unwrap();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn validates_tun_mode() {
+        let config: Config = serde_yaml::from_str(
+            "upstream: socks5://127.0.0.1:1080\n\
+             tun_mode:\n  interface_name: netplus\n  mtu: 1500\n",
+        )
+        .unwrap();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_unsafe_tun_interface_name() {
+        let config: Config = serde_yaml::from_str(
+            "upstream: socks5://127.0.0.1:1080\n\
+             tun_mode:\n  interface_name: \"netplus'; Remove-NetRoute\"\n",
         )
         .unwrap();
         assert!(config.validate().is_err());
